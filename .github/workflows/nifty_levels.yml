@@ -1,0 +1,80 @@
+name: Nifty Level Detector
+
+on:
+  workflow_dispatch:   # Manual Run Only
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance pandas numpy statsmodels scikit-learn requests
+
+      - name: Run Nifty Analysis Script
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          python << 'EOF'
+import os
+import requests
+from datetime import datetime, timedelta
+
+# --------------------------
+# 1. AUTOMATIC LAST MARKET OPEN DAY
+# --------------------------
+def last_market_day():
+    today = datetime.now().date()
+    weekday = today.weekday()  # Monday=0 ... Sunday=6
+
+    if weekday == 0:  # Monday → use Friday
+        return today - timedelta(days=3)
+    elif weekday == 6:  # Sunday
+        return today - timedelta(days=2)
+    elif weekday == 5:  # Saturday
+        return today - timedelta(days=1)
+    else:
+        return today - timedelta(days=1)
+
+target = last_market_day()
+target_str = target.strftime("%d-%m-%Y")
+
+print("Detected Last Market Day:", target_str)
+
+# --------------------------
+# 2. RUN YOUR HEAVY SCRIPT
+# --------------------------
+# IMPORTANT: your main file must be named `scikit_statsmodel.py`
+# and it must accept date via input()
+import subprocess
+
+proc = subprocess.Popen(
+    ["python", "scikit_statsmodel.py"],
+    stdin=subprocess.PIPE,
+    text=True
+)
+proc.communicate(input=target_str)
+
+# --------------------------
+# 3. SEND TELEGRAM ALERT
+# --------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
+msg = f"Nifty levels generated for {target_str}"
+url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+
+EOF
