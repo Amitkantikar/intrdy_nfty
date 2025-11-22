@@ -1,7 +1,7 @@
 name: Nifty Level Detector
 
 on:
-  workflow_dispatch:   # Manual Run Only
+  workflow_dispatch:
 
 jobs:
   run-script:
@@ -26,14 +26,14 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
-          python << 'EOF'
+          python - << 'EOF'
 import os, requests, subprocess
 from datetime import datetime, timedelta
 
 def last_market_day():
     today = datetime.now().date()
-    wd = today.weekday()  # Monday=0 ... Sunday=6
-    if wd == 0:  # Monday → use Friday
+    wd = today.weekday()
+    if wd == 0:  # Monday
         return today - timedelta(days=3)
     elif wd == 6:  # Sunday
         return today - timedelta(days=2)
