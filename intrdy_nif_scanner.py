@@ -1,656 +1,372 @@
-# nifty_zone_predictor.py
-"""
-Upgraded Supply/Demand zone extractor + bias & probability model for intraday use.
-Author: ChatGPT (adapted for your existing script)
-Requirements:
-  pip install yfinance pandas numpy scipy
-Usage:
-  python nifty_zone_predictor.py
-It will prompt for a date (dd-mm-yyyy) or ENTER for yesterday.
-"""
-
-import warnings
+import warnings;
 warnings.filterwarnings("ignore")
-import yfinance as yf
-import numpy as np
-import pandas as pd
+import yfinance as yf, numpy as np, pandas as pd
 from datetime import datetime, timedelta
-from scipy.stats import zscore
+from statsmodels.robust.scale import mad
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import IsolationForest
 
-# -------------------------
-# Helper utils
-# -------------------------
-def to_float(x):
-    return float(np.array(x, dtype=float).astype(float).item())
 
-def pct(a, b):
-    return (a - b) / b * 100.0
+def robust_z(x): x = np.asarray(x, float);m = np.nanmedian(x);s = mad(x);return (
+                                                                                        x - m) / s if s != 0 else np.zeros_like(
+    x)
 
-# -------------------------
-# CONFIG (tune these)
-# -------------------------
-SYMBOL = "^NSEI"
-INTERVAL = "5m"
-LOOKBACK_DAYS = 14
 
-# Minimum quality settings
-MIN_ZONE_WIDTH = 6            # minimum absolute points between zone bounds
-MIN_IMPULSE = 30              # points price must move after zone (used in filtering)
-TOP_ZONES = 3                 # top N demand & supply zones to return
-MERGE_PCT = 0.02 / 100.0   # 0.02% = ~5 pts for Nifty
-VOLUME_SPIKE_Z = 1.25         # z-score threshold to call a volume spike
-WICK_BODY_WEIGHT = 0.6        # weighting between wick vs body for rejection
-MIN_TOUCHES = 1               # minimum touches to consider zone
-EMA_SHORT = 20                # for HTF trend (on 15m)
-EMA_LONG = 50                 # for HTF trend (on 1h)
-# Probability model weights (you can tune)
-WEIGHTS = {
-    "strength": 0.35,
-    "volume": 0.20,
-    "confluence": 0.25,
-    "htf_trend": 0.10,
-    "gap": 0.10
-}
+def skl_z(x): x = np.asarray(x, float).reshape(-1, 1);sc = StandardScaler();return sc.fit_transform(x).flatten() if len(
+    x) > 1 else np.zeros(len(x))
 
-# -------------------------
-# Read target date from user
-# -------------------------
-user_date = input("Enter date (dd-mm-yyyy) or press ENTER for yesterday: ").strip()
 
-if user_date:
-    target_date = datetime.strptime(user_date, "%d-%m-%Y").date()
-else:
-    target_date = (datetime.today() - timedelta(days=1)).date()
+def iso_anom(x): x = np.asarray(x, float).reshape(-1, 1);clf = IsolationForest(contamination=0.06,
+                                                                               random_state=42);return (
+        clf.fit_predict(x) == -1).astype(int)
 
-print(f"\nExtracting levels for date: {target_date}\n")
 
-# -------------------------
-# Download data
-# -------------------------
-# We'll fetch a little extra (LOOKBACK_DAYS) to compute HTF etc.
-data = yf.download(SYMBOL, period=f"{LOOKBACK_DAYS}d", interval=INTERVAL, progress=False)
-if data.empty:
-    raise Exception("No data downloaded. Check internet or symbol.")
+def vol_z(df):
+    v = df["Volume"].values.astype(float)
+    if len(v) < 3: return np.zeros(len(v)), np.zeros(len(v)), np.zeros(len(v))
+    rz = robust_z(v);
+    sz = skl_z(v);
+    an = iso_anom(v);
+    fz = 0.5 * rz + 0.3 * sz + 0.2 * an
+    return fz, rz, sz
 
-# Remove tzinfo for consistent date matching
+
+def pct(a, b): return (a - b) / b * 100
+
+
+SY = "^NSEI";
+INT = "5m";
+LB = 14;
+MINW = 6;
+MINI = 30;
+TOP = 3;
+MER = 0.02 / 100;
+VZ = 1.25;
+ES = 20;
+EL = 50
+W = {"strength": 0.35, "volume": 0.20, "confluence": 0.25, "htf_trend": 0.10, "gap": 0.10}
+
+u = input("Enter date (dd-mm-yyyy) or press ENTER for yesterday: ").strip()
+TD = datetime.strptime(u, "%d-%m-%Y").date() if u else (datetime.today() - timedelta(days=1)).date()
+
+df = yf.download(SY, period=f"{LB}d", interval=INT, progress=False)
+if df.empty: raise Exception("No data")
 try:
-    data = data.tz_localize(None)
-    # ---- FIX: Flatten multiindex columns from yfinance ----
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = [c[0] for c in data.columns]
-    # ---------------------------------------------------------
-
-    # >>> ADD THESE 3 LINES HERE <<<
-    print("\n--- DEBUG: Data Preview ---")
-    print(data.head())
-    print(data.columns)
-    print(data.tail())
-    print("---------------------------\n")
-    # >>> END DEBUG <<<
-except Exception:
+    df = df.tz_localize(None)
+    if isinstance(df.columns, pd.MultiIndex): df.columns = [c[0] for c in df.columns]
+except:
     pass
 
-# Helper: split prev day and next day (intraday)
-prev_day_mask = data.index.date == target_date
-next_day_mask = data.index.date == (target_date + timedelta(days=1))
+pm = df.index.date == TD;
+nx = df.index.date == (TD + timedelta(days=1))
+pr = df.loc[pm].copy();
+nxdf = df.loc[nx].copy()
+if pr.empty: raise Exception("No intraday")
 
-prev = data.loc[prev_day_mask].copy()
-next_day = data.loc[next_day_mask].copy()
+d15 = df.resample("15T").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
+d1 = df.resample("60T").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
 
-if prev.empty:
-    raise Exception(f"No intraday data for {target_date}")
+PDH = float(pr["High"].max());
+PDL = float(pr["Low"].min());
+PDO = float(pr["Open"].iloc[0]);
+PDC = float(pr["Close"].iloc[-1])
 
-# Also prepare HTF by resampling
-data_15m = data.resample("15T").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna()
-data_1h  = data.resample("60T").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna()
 
-# -------------------------
-# Basic PDH/PDL/PDO/PDC
-# -------------------------
-highs = np.array(prev["High"], dtype=float)
-lows = np.array(prev["Low"], dtype=float)
-opens = np.array(prev["Open"], dtype=float)
-closes = np.array(prev["Close"], dtype=float)
+def rawzones(df, s=3):
+    lo = df["Low"].values.astype(float);
+    hi = df["High"].values.astype(float)
+    op = df["Open"].values.astype(float);
+    cl = df["Close"].values.astype(float);
+    n = len(lo)
+    d = [];
+    sp = []
+    for i in range(s, n - s):
+        if lo[i] == lo[i - s:i + s + 1].min(): d.append(
+            {"low": float(lo[i]), "high": float(max(op[i], cl[i], hi[i])), "idx": df.index[i]})
+        if hi[i] == hi[i - s:i + s + 1].max(): sp.append(
+            {"low": float(min(op[i], cl[i], lo[i])), "high": float(hi[i]), "idx": df.index[i]})
+    return d, sp
 
-PDH = float(np.max(highs))
-PDL = float(np.min(lows))
-PDO = float(opens[0])
-PDC = float(closes[-1])
 
-# -------------------------
-# Raw zone detection (swing-based)
-# -------------------------
-def detect_raw_zones(df, strength=3):
-    """
-    Detect swing highs (supply) and swing lows (demand).
-    For each index i, if high is local maximum over window -> supply
-                       if low is local minimum -> demand
-    Return lists of (low_bound, high_bound, center_idx, touch_count_est)
-    """
-    lows = df["Low"].values.astype(float)
-    highs = df["High"].values.astype(float)
-    opens = df["Open"].values.astype(float)
-    closes = df["Close"].values.astype(float)
-    n = len(lows)
+rd, rs = rawzones(pr, 3)
 
-    demand = []
-    supply = []
 
-    for i in range(strength, n - strength):
-        window_lows = lows[i-strength:i+strength+1]
-        window_highs = highs[i-strength:i+strength+1]
-
-        # demand (local low)
-        if lows[i] == np.min(window_lows):
-            # make zone from low wick up to nearby candle open/body high
-            low_z = float(lows[i])
-            # Use subsequent candle open/close as top of zone (conservative)
-            high_z = float(max(opens[i], closes[i], highs[i]))
-            demand.append({"low": low_z, "high": high_z, "idx": df.index[i]})
-
-        # supply (local high)
-        if highs[i] == np.max(window_highs):
-            high_z = float(highs[i])
-            low_z = float(min(opens[i], closes[i], lows[i]))
-            supply.append({"low": low_z, "high": high_z, "idx": df.index[i]})
-
-    return demand, supply
-
-raw_demand, raw_supply = detect_raw_zones(prev, strength=3)
-
-# -------------------------
-# Simple Order Block detection (heuristic)
-# -------------------------
-def detect_order_blocks(df, lookback=6):
-    """
-    Heuristic detection of bullish/bearish order blocks:
-    - Bullish OB: bearish candle (body down) followed by strong bullish impulse that breaks structure
-    - Bearish OB: bullish candle followed by strong bearish impulse
-    This is a heuristic to add confluence.
-    Returns list of OBs: {'type': 'bull'/'bear', 'low':..., 'high':..., 'idx': ...}
-    """
-    ob_list = []
-    o = df["Open"].values.astype(float)
+def ob(df):
+    o = df["Open"].values.astype(float);
     c = df["Close"].values.astype(float)
-    h = df["High"].values.astype(float)
-    l = df["Low"].values.astype(float)
+    h = df["High"].values.astype(float);
+    l = df["Low"].values.astype(float);
+    o2 = []
+    for i in range(1, len(df) - 1):
+        pb = c[i - 1] - o[i - 1];
+        cb = c[i] - o[i]
+        if pb < 0 and cb > 0 and abs(cb) > abs(pb) * 0.6: o2.append(
+            {"low": min(o[i - 1], c[i - 1], l[i - 1]), "high": max(o[i - 1], c[i - 1], h[i - 1]),
+             "idx": df.index[i - 1]})
+        if pb > 0 and cb < 0 and abs(cb) > abs(pb) * 0.6: o2.append(
+            {"low": min(o[i - 1], c[i - 1], l[i - 1]), "high": max(o[i - 1], c[i - 1], h[i - 1]),
+             "idx": df.index[i - 1]})
+    return o2
 
-    for i in range(1, len(df)-1):
-        prev_body = c[i-1] - o[i-1]
-        curr_body = c[i] - o[i]
 
-        # bullish order-block: previous candle bearish and current bullish strong
-        if prev_body < 0 and curr_body > 0 and abs(curr_body) > abs(prev_body)*0.6:
-            low_z = min(o[i-1], c[i-1], l[i-1])
-            high_z = max(o[i-1], c[i-1], h[i-1])
-            ob_list.append({"type":"bull", "low": float(low_z), "high": float(high_z), "idx": df.index[i-1]})
+OBS = ob(pr)
 
-        # bearish order-block
-        if prev_body > 0 and curr_body < 0 and abs(curr_body) > abs(prev_body)*0.6:
-            low_z = min(o[i-1], c[i-1], l[i-1])
-            high_z = max(o[i-1], c[i-1], h[i-1])
-            ob_list.append({"type":"bear", "low": float(low_z), "high": float(high_z), "idx": df.index[i-1]})
 
-    return ob_list
-
-order_blocks = detect_order_blocks(prev)
-
-# -------------------------
-# Fair Value Gaps (FVG) detection
-# -------------------------
-def detect_fvg(df):
-    """
-    Detect simple fair value gaps: a gap between two consecutive candles' bodies.
-    If candle i low > candle i-1 high -> up gap (FVG)
-    If candle i high < candle i-1 low -> down gap
-    Returns FVG list
-    """
-    fvg = []
-    o = df["Open"].values.astype(float)
+def fvg(df):
+    o = df["Open"].values.astype(float);
     c = df["Close"].values.astype(float)
-    h = df["High"].values.astype(float)
-    l = df["Low"].values.astype(float)
-
+    h = df["High"].values.astype(float);
+    l = df["Low"].values.astype(float);
+    f = []
     for i in range(1, len(df)):
-        prev_body_top = max(o[i-1], c[i-1])
-        prev_body_bot = min(o[i-1], c[i-1])
-        curr_body_top = max(o[i], c[i])
-        curr_body_bot = min(o[i], c[i])
+        pbt = max(o[i - 1], c[i - 1]);
+        pbb = min(o[i - 1], c[i - 1])
+        cbt = max(o[i], c[i]);
+        cbb = min(o[i], c[i])
+        if cbb > pbt: f.append({"low": pbt, "high": cbb, "idx": df.index[i]})
+        if cbt < pbb: f.append({"low": cbt, "high": pbb, "idx": df.index[i]})
+    return f
 
-        # Up gap (bullish FVG)
-        if curr_body_bot > prev_body_top:
-            fvg.append({"type":"bull", "low": prev_body_top, "high": curr_body_bot, "idx": df.index[i]})
-        # Down gap (bearish FVG)
-        if curr_body_top < prev_body_bot:
-            fvg.append({"type":"bear", "low": curr_body_top, "high": prev_body_bot, "idx": df.index[i]})
 
-    return fvg
+FVG = fvg(pr)
 
-fvgs = detect_fvg(prev)
 
-# -------------------------
-# Zone cleansing, clustering & scoring
-# -------------------------
-def zone_overlap(z1, z2):
-    # True if zones overlap (range overlap)
-    return not (z1["high"] < z2["low"] or z2["high"] < z1["low"])
+def ov(a, b): return not (a["high"] < b["low"] or b["high"] < a["low"])
 
-def merge_zones(zones):
-    # zones: list of dicts with low, high
-    if not zones:
-        return []
-    # sort by low
-    zones_sorted = sorted(zones, key=lambda z: z["low"])
-    merged = []
-    cur = zones_sorted[0].copy()
-    for z in zones_sorted[1:]:
-        # if overlap or within MERGE_PCT of each other, merge
-        gap_pct = abs(z["low"] - cur["high"]) / cur["high"] if cur["high"] != 0 else 0
-        if zone_overlap(cur, z) or gap_pct <= MERGE_PCT:
-            cur["low"] = min(cur["low"], z["low"])
-            cur["high"] = max(cur["high"], z["high"])
-            # merge index list
-            cur.setdefault("idxs", set())
-            cur.setdefault("sources", set())
-            cur["idxs"].add(z.get("idx", None))
-            if "source" in z:
-                cur["sources"].add(z["source"])
+
+def merge(z):
+    if not z: return []
+    z = sorted(z, key=lambda x: x["low"]);
+    m = [];
+    c = z[0].copy()
+    for x in z[1:]:
+        gp = abs(x["low"] - c["high"]) / (c["high"] if c["high"] != 0 else 1)
+        if ov(c, x) or gp <= MER:
+            c["low"] = min(c["low"], x["low"]);
+            c["high"] = max(c["high"], x["high"])
         else:
-            merged.append(cur)
-            cur = z.copy()
-    merged.append(cur)
-    return merged
+            m.append(c);c = x.copy()
+    m.append(c);
+    return m
 
-def count_zone_touches(zone, df, tol_pct=0.002):  # tolerance 0.2%
-    # count how many times price entered the zone (based on Low/High)
-    low, high = zone["low"], zone["high"]
-    tol_low = low * (1 - tol_pct)
-    tol_high = high * (1 + tol_pct)
-    touches = ((df["Low"] <= tol_high) & (df["High"] >= tol_low)).sum()
-    return int(touches)
 
-def wick_body_score(idx, df):
-    # compute wick vs body dominance for the candle at idx (index label)
-    # return value 0..1 where higher = stronger wick rejection
+def touch(z, df, t=0.002):
+    lo, hi = z["low"], z["high"];
+    lo2 = lo * (1 - t);
+    hi2 = hi * (1 + t)
+    return int(((df["Low"] <= hi2) & (df["High"] >= lo2)).sum())
+
+
+def wbs(i, df):
     try:
-        row = df.loc[idx]
-    except KeyError:
+        r = df.loc[i]
+    except:
         return 0.5
-    o, c, h, l = row["Open"], row["Close"], row["High"], row["Low"]
-    body = abs(c - o)
-    upper_wick = h - max(c, o)
-    lower_wick = min(c, o) - l
-    # bigger wick relative to body increases rejection score
-    wick = max(upper_wick, lower_wick)
-    denom = body + wick
-    if denom == 0:
-        return 0.5
-    return float(wick / denom)
+    o, c, h, l = r["Open"], r["Close"], r["High"], r["Low"]
+    b = abs(c - o);
+    uw = h - max(c, o);
+    lw = min(c, o) - l;
+    w = max(uw, lw);
+    d = b + w
+    return w / d if d != 0 else 0.5
 
-def avg_volume_zscore(df):
-    # return volume z-scores for the day's candles
-    vols = df["Volume"].values.astype(float)
-    if len(vols) < 3:
-        return np.zeros_like(vols)
-    return zscore(vols, nan_policy='omit')
 
-def score_and_filter(raw_zones, df, next_day_df, zone_type="demand"):
-    """
-    For each zone produce:
-       - width
-       - touches
-       - wick/body score at creation index (how strong rejection)
-       - volume spike at creation (zscore)
-       - impulse (how much next day moved away)
-    Then compute a final strength metric (0..1)
-    """
-    results = []
-    vol_z = avg_volume_zscore(df)
-
-    for z in raw_zones:
-        zone = {"low": z["low"], "high": z["high"], "idx": z.get("idx")}
-        # width
-        width = abs(zone["high"] - zone["low"])
-        if width > 80:  # do not allow huge zones
-            continue
-
-        # touches (how many times price visited in prev day)
-        touches = count_zone_touches(zone, df, tol_pct=0.002)
-
-        # wick/body score (if idx exists)
-        wbs = wick_body_score(zone["idx"], df)
-
-        # volume spike at the creation candle (approx)
+def score(rz, df, nd, tp):
+    out = [];
+    vz, rz2, sz2 = vol_z(df)
+    for z in rz:
+        lo, hi = z["low"], z["high"];
+        idx = z["idx"];
+        wd = abs(hi - lo)
+        if wd > 80: continue
+        tc = touch(z, df);
+        wb = wbs(idx, df)
         try:
-            pos = df.index.get_loc(zone["idx"])
-            vol_zscore = float(vol_z[pos]) if pos < len(vol_z) else 0.0
-        except Exception:
-            vol_zscore = 0.0
+            p = df.index.get_loc(idx);v = vz[p]
+        except:
+            v = 0
+        imp = 0
+        if not nd.empty:
+            c = nd["Close"].values.astype(float)
+            imp = max(np.max(c) - hi, lo - np.min(c))
+        ts = min(tc, 6) / 6;
+        vs = 1 if v >= VZ else max(0, 1 - abs(v) / 3);
+        iscore = min(max(imp / 100, 0), 1)
+        s = 0.35 * ts + 0.25 * wb + 0.25 * vs + 0.15 * iscore
+        out.append({"low": lo, "high": hi, "idx": idx, "width": wd, "touches": tc, "vol_zscore": v, "wick_score": wb,
+                    "impulse": imp, "strength": s, "type": tp})
+    return sorted(out, key=lambda x: x["strength"], reverse=True)
 
-        # next-day impulse: how much price in next day moved away from zone
-        imp = 0.0
-        if not next_day_df.empty:
-            closes_next = next_day_df["Close"].values.astype(float)
-            # movement above zone_high
-            max_move_up = np.max(closes_next) - zone["high"]
-            max_move_down = zone["low"] - np.min(closes_next)
-            imp = max(max_move_up, max_move_down)
 
-        if imp < MIN_IMPULSE:
-            # optional: skip if next day didn't show impulse. But sometimes you want zones for intraday same day.
-            # We'll allow but penalize in scoring.
-            pass
+SD = score(rd, pr, nxdf, "demand");
+SS = score(rs, pr, nxdf, "supply")
+OB = [{"low": x["low"], "high": x["high"], "idx": x["idx"], "source": "ob"} for x in OBS]
+FG = [{"low": x["low"], "high": x["high"], "idx": x["idx"], "source": "fvg"} for x in FVG]
+ALL = []
+for s in SD: ALL.append({"low": s["low"], "high": s["high"], "idx": s["idx"], "source": "demand"})
+for s in SS: ALL.append({"low": s["low"], "high": s["high"], "idx": s["idx"], "source": "supply"})
+ALL += OB + FG
+M = merge(ALL)
 
-        # base score components
-        # normalize: touches (scale 0..1 maybe 0..5), width scaled (bigger width often weaker but we keep moderate)
-        touches_score = min(touches, 6) / 6.0
-        vol_score = 1.0 if vol_zscore >= VOLUME_SPIKE_Z else (max(0.0, 1 - abs(vol_zscore)/3.0))
-        wick_score = wbs  # 0..1
-        imp_score = min(max(imp / 100.0, 0.0), 1.0)  # scale impulse to 0..1 assuming 100 pts = strong
 
-        # combine into strength metric (weights chosen heuristically)
-        strength = (0.35 * touches_score) + (0.25 * wick_score) + (0.25 * vol_score) + (0.15 * imp_score)
+def conf(z, SD, SS, OB, FG):
+    lo, hi = z["low"], z["high"];
+    c = {"demand": 0, "supply": 0, "ob": 0, "fvg": 0}
+    for s in SD:
+        if ov(z, s): c["demand"] += 1
+    for s in SS:
+        if ov(z, s): c["supply"] += 1
+    for s in OB:
+        if ov(z, s): c["ob"] += 1
+    for s in FG:
+        if ov(z, s): c["fvg"] += 1
+    return c, sum(c.values())
 
-        results.append({
-            "low": zone["low"],
-            "high": zone["high"],
-            "idx": zone["idx"],
-            "width": width,
-            "touches": touches,
-            "vol_zscore": vol_zscore,
-            "wick_score": wick_score,
-            "impulse": imp,
-            "strength": strength,
-            "type": zone_type
-        })
 
-    # sort by strength desc and return
-    results_sorted = sorted(results, key=lambda x: x["strength"], reverse=True)
-    return results_sorted
+F = []
+for z in M:
+    c, tc = conf(z, SD, SS, OB, FG)
+    a = None
+    for s in SD + SS:
+        if ov(z, s): a = s;break
+    t = a["touches"] if a else touch(z, pr);
+    w = a["wick_score"] if a else 0.5;
+    v = a["vol_zscore"] if a else 0;
+    wd = abs(z["high"] - z["low"])
+    if wd < MINW: continue
+    bs = 0.4 * min(t, 6) / 6 + 0.35 * w + 0.25 * (1 if v >= VZ else max(0, 1 - abs(v) / 3))
+    F.append({"low": z["low"], "high": z["high"], "width": wd, "touches": t, "wick_score": w, "vol_zscore": v,
+              "confluence": c, "confluence_count": tc, "base_strength": bs})
 
-# Score demand and supply raw zones
-scored_demand = score_and_filter(raw_demand, prev, next_day, zone_type="demand")
-scored_supply = score_and_filter(raw_supply, prev, next_day, zone_type="supply")
+F = sorted(F, key=lambda z: z["base_strength"] + 0.15 * z["confluence_count"], reverse=True)
+TDZ = [z for z in F if (z["low"] + z["high"]) / 2 <= PDC][:TOP]
+TSZ = [z for z in F if (z["low"] + z["high"]) / 2 > PDC][:TOP]
+if len(TDZ) < TOP: TDZ = F[:TOP]
+if len(TSZ) < TOP: TSZ = F[:TOP]
 
-# Also include order blocks and fvgs as potential zones (for confluence)
-# Convert order_blocks and fvgs into same dict format and score lightly
-ob_zones = []
-for ob in order_blocks:
-    ob_zones.append({"low": ob["low"], "high": ob["high"], "idx": ob["idx"], "type":"ob"})
+d15["ema"] = d15["Close"].ewm(span=ES, adjust=False).mean()
+d1["ema"] = d1["Close"].ewm(span=EL, adjust=False).mean()
+st = "up" if d15["Close"].iloc[-1] > d15["ema"].iloc[-1] else "down"
+lt = "up" if d1["Close"].iloc[-1] > d1["ema"].iloc[-1] else "down"
 
-fvg_zones = []
-for f in fvgs:
-    fvg_zones.append({"low": f["low"], "high": f["high"], "idx": f["idx"], "type":"fvg"})
+op = float(nxdf["Open"].iloc[0]) if not nxdf.empty else PDC
+g = op - PDC;
+gp = pct(op, PDC)
+gb = "bullish" if gp > 0.06 else ("bearish" if gp < -0.06 else "neutral")
 
-# Merge similar zones across demand/supply + OB + FVG to reduce noise
-all_candidate_zones = []
-for s in scored_demand:
-    s2 = s.copy()
-    s2["source"] = "demand"
-    all_candidate_zones.append(s2)
-for s in scored_supply:
-    s2 = s.copy()
-    s2["source"] = "supply"
-    all_candidate_zones.append(s2)
-for ob in ob_zones:
-    ob2 = ob.copy()
-    ob2["source"] = "ob"
-    all_candidate_zones.append(ob2)
-for f in fvg_zones:
-    f2 = f.copy()
-    f2["source"] = "fvg"
-    all_candidate_zones.append(f2)
 
-# Consolidate zone dicts (we'll create minimal zone entries for merging)
-zone_minimal = []
-for z in all_candidate_zones:
-    zone_minimal.append({
-        "low": z["low"],
-        "high": z["high"],
-        "idx": z.get("idx"),
-        "source": z.get("source", "cand")
-    })
+def prob(z, st, lt, gb):
+    s = min(max(z["base_strength"], 0), 1)
+    v = z["vol_zscore"];
+    v1 = 1 if v >= VZ else max(0, 1 - abs(v) / 3)
+    c = min(z["confluence_count"] / 4, 1)
+    mid = (z["low"] + z["high"]) / 2;
+    exp = "bear" if mid > PDC else "bull"
+    ha = 1 if ((exp == "bull" and lt == "up") or (exp == "bear" and lt == "down")) else 0
+    ga = 1 if ((gb == "bullish" and exp == "bull") or (gb == "bearish" and exp == "bear")) else 0
+    raw = W["strength"] * s + W["volume"] * v1 + W["confluence"] * c + W["htf_trend"] * ha + W["gap"] * ga
+    pr = min(max(raw * 100, 0), 100);
+    return pr, 100 - pr
 
-merged = merge_zones(zone_minimal)
 
-# After merging, compute combined strength/confluence:
-def compute_confluence(merged_zone, scored_demand, scored_supply, ob_zones, fvg_zones):
-    low, high = merged_zone["low"], merged_zone["high"]
-    conf = {"demand":0, "supply":0, "ob":0, "fvg":0}
-    # check overlaps
-    for s in scored_demand:
-        if not (s["high"] < low or s["low"] > high):
-            conf["demand"] += 1
-    for s in scored_supply:
-        if not (s["high"] < low or s["low"] > high):
-            conf["supply"] += 1
-    for ob in ob_zones:
-        if not (ob["high"] < low or ob["low"] > high):
-            conf["ob"] += 1
-    for f in fvg_zones:
-        if not (f["high"] < low or f["low"] > high):
-            conf["fvg"] += 1
-    # confluence count
-    total_conf = conf["demand"] + conf["supply"] + conf["ob"] + conf["fvg"]
-    return conf, total_conf
-
-final_zones = []
-for mz in merged:
-    conf, total_conf = compute_confluence(mz, scored_demand, scored_supply, ob_zones, fvg_zones)
-    # estimate touches and wick_score using closest scored zone if exists
-    # find nearest candidate in scored lists
-    associated = None
-    for s in (scored_demand + scored_supply):
-        # overlap test
-        if not (s["high"] < mz["low"] or s["low"] > mz["high"]):
-            associated = s
-            break
-
-    touches = associated["touches"] if associated else count_zone_touches(mz, prev)
-    wick_score = associated["wick_score"] if associated else 0.5
-    vol_zscore = associated["vol_zscore"] if associated else 0.0
-    width = abs(mz["high"] - mz["low"])
-
-    base_strength = (0.4 * min(touches, 6)/6.0) + (0.35 * wick_score) + (0.25 * (1 if vol_zscore >= VOLUME_SPIKE_Z else max(0.0, 1 - abs(vol_zscore)/3.0)))
-    # penalize tiny width too small or huge width
-    if width < MIN_ZONE_WIDTH:
-        continue
-
-    final_zones.append({
-        "low": mz["low"],
-        "high": mz["high"],
-        "width": width,
-        "touches": touches,
-        "wick_score": wick_score,
-        "vol_zscore": vol_zscore,
-        "confluence": conf,
-        "confluence_count": total_conf,
-        "base_strength": base_strength
-    })
-
-# Sort zones by combined metric (base_strength + confluence weight)
-final_zones_sorted = sorted(final_zones, key=lambda z: (z["base_strength"] + 0.15*z["confluence_count"]), reverse=True)
-
-# Keep top supply & demand separately
-top_demands = [z for z in final_zones_sorted if (z["low"] + z["high"]) / 2 <= PDC][:TOP_ZONES]
-top_supplies = [z for z in final_zones_sorted if (z["low"] + z["high"]) / 2 > PDC][:TOP_ZONES]
-
-# If not enough by above splitting, just take top by score
-if len(top_demands) < TOP_ZONES:
-    top_demands = final_zones_sorted[:TOP_ZONES]
-if len(top_supplies) < TOP_ZONES:
-    top_supplies = final_zones_sorted[:TOP_ZONES]
-
-# -------------------------
-# HTF Trend Filter
-# -------------------------
-def htf_trend(data_15m, data_1h):
-    # compute EMA trend direction on HTFs
-    data_15m["ema_short"] = data_15m["Close"].ewm(span=EMA_SHORT, adjust=False).mean()
-    data_1h["ema_long"] = data_1h["Close"].ewm(span=EMA_LONG, adjust=False).mean()
-
-    # last values
-    last_15m = data_15m["Close"].iloc[-1]
-    ema_15m = data_15m["ema_short"].iloc[-1]
-    last_1h = data_1h["Close"].iloc[-1]
-    ema_1h = data_1h["ema_long"].iloc[-1]
-
-    short_trend = "up" if last_15m > ema_15m else "down"
-    long_trend = "up"  if last_1h > ema_1h else "down"
-    return short_trend, long_trend
-
-short_trend, long_trend = htf_trend(data_15m.copy(), data_1h.copy())
-
-# -------------------------
-# Pre-market gap & open bias
-# -------------------------
-# Use next_day first candle open if available as 'market open' reference
-if not next_day.empty:
-    next_day_open = float(next_day["Open"].iloc[0])
-else:
-    # fallback to today's first available or previous close
-    next_day_open = float(PDC)
-
-gap = next_day_open - PDC
-gap_pct = pct(next_day_open, PDC)
-
-# simple gap bias
-gap_bias = None
-if gap_pct > 0.06:   # >0.06% up gap
-    gap_bias = "bullish_gap"
-elif gap_pct < -0.06:
-    gap_bias = "bearish_gap"
-else:
-    gap_bias = "neutral_gap"
-
-# -------------------------
-# Probability model (very simple linear combination -> 0..100)
-# -------------------------
-def zone_probability(zone, short_trend, long_trend, gap_bias):
-    """
-    Combine signals:
-     - strength (base_strength)
-     - volume presence (vol_zscore)
-     - confluence_count
-     - HTF trend alignment
-     - gap alignment
-    Return: probability_of_reversal (0..100), probability_of_breakout (0..100)
-    """
-    # normalize components to 0..1
-    strength = min(max(zone["base_strength"], 0.0), 1.0)
-    vol = 1.0 if zone["vol_zscore"] >= VOLUME_SPIKE_Z else max(0.0, 1 - abs(zone["vol_zscore"])/3.0)
-    conf = min(zone["confluence_count"] / 4.0, 1.0)  # 4 or more confluence = strong
-    # HTF alignment: if HTF (long_trend) matches expected direction (supply vs demand)
-    zone_mid = (zone["low"] + zone["high"]) / 2.0
-    # if zone is above open/close -> treated as supply zone (likely short)
-    expected_direction = "bear" if zone_mid > PDC else "bull"
-    htf_align = 1.0 if ((expected_direction == "bull" and long_trend == "up") or (expected_direction == "bear" and long_trend == "down")) else 0.0
-    # gap alignment: if gap direction supports expected_direction
-    if gap_bias == "bullish_gap" and expected_direction == "bull":
-        gap_align = 1.0
-    elif gap_bias == "bearish_gap" and expected_direction == "bear":
-        gap_align = 1.0
-    else:
-        gap_align = 0.0
-
-    # raw weighted sum
-    raw = (WEIGHTS["strength"] * strength +
-           WEIGHTS["volume"] * vol +
-           WEIGHTS["confluence"] * conf +
-           WEIGHTS["htf_trend"] * htf_align +
-           WEIGHTS["gap"] * gap_align)
-
-    # probability of reversal increases with strength and confluence; probability of breakout is inverse-ish
-    prob_reversal = min(max(raw * 100.0, 0.0), 100.0)
-    prob_breakout = max(0.0, 100.0 - prob_reversal)  # simple heuristic
-
-    return prob_reversal, prob_breakout
-
-# Compute probabilities for top zones
-for z in top_demands + top_supplies:
-    pr, pb = zone_probability(z, short_trend, long_trend, gap_bias)
-    z["prob_reversal"] = round(pr, 1)
+for z in TDZ + TSZ:
+    pr, pb = prob(z, st, lt, gb)
+    z["prob_reversal"] = round(pr, 1);
     z["prob_breakout"] = round(pb, 1)
 
-# -------------------------
-# FINAL DAILY BIAS (aggregate)
-# -------------------------
-# Use weighted average of top zones' expected direction and HTF/gap
-score_bull = 0.0
-score_bear = 0.0
-for z in top_demands + top_supplies:
-    mid = (z["low"] + z["high"]) / 2.0
-    if mid <= PDC:
-        score_bull += z["prob_reversal"]
+sb = 0;
+sr = 0
+for z in TDZ + TSZ:
+    if (z["low"] + z["high"]) / 2 <= PDC:
+        sb += z["prob_reversal"]
     else:
-        score_bear += z["prob_reversal"]
-
-# incorporate HTF
-if long_trend == "up":
-    score_bull += 10
+        sr += z["prob_reversal"]
+if lt == "up":
+    sb += 10
 else:
-    score_bear += 10
+    sr += 10
+if gb == "bullish":
+    sb += 8
+elif gb == "bearish":
+    sr += 8
+bias = "Bullish" if sb > sr else ("Bearish" if sr > sb else "Neutral")
 
-# incorporate gap
-if gap_bias == "bullish_gap":
-    score_bull += 8
-elif gap_bias == "bearish_gap":
-    score_bear += 8
 
-if score_bull > score_bear:
-    daily_bias = "Bullish"
-elif score_bear > score_bull:
-    daily_bias = "Bearish"
-else:
-    daily_bias = "Neutral"
+def pz(z, s):
+    print(f"--- {s} ---")
+    print(f"{z['low']:.2f}-{z['high']:.2f} w:{z['width']:.2f}")
+    print(f"t:{z['touches']} w:{z['wick_score']:.2f} v:{z['vol_zscore']:.2f}")
+    print(f"c:{z['confluence']} C:{z['confluence_count']}")
+    print(f"b:{z['base_strength']:.3f} R:{z['prob_reversal']} B:{z['prob_breakout']}")
 
-# -------------------------
-# PRINT / OUTPUT
-# -------------------------
-def print_zone(z, side="Demand"):
-    print(data.head())
-    print(data.columns)
-    print(data.tail())
 
-    print(f"--- {side} Zone ---")
-    print(f"Range: {z['low']:.2f} → {z['high']:.2f}  width: {z['width']:.2f}")
-    print(f"Touches: {z['touches']}  wick_score:{z['wick_score']:.2f}  vol_z:{z['vol_zscore']:.2f}")
-    print(f"Confluence: {z['confluence']}  confluence_count:{z['confluence_count']}")
-    print(f"Base strength: {z['base_strength']:.3f}")
-    print(f"P(reversal)={z['prob_reversal']}%  P(breakout)={z['prob_breakout']}%")
-    print()
+def magic_levels(df):
+    if not isinstance(df, pd.DataFrame): return []
+    if df.empty: return []
+    if "High" not in df.columns or "Low" not in df.columns or "Close" not in df.columns: return []
 
-print("====================================")
-print(f" TOP LEVELS FOR {target_date} (Enhanced)")
-print("====================================\n")
-print(f"PDH : {PDH:.2f}")
-print(f"PDL : {PDL:.2f}")
-print(f"PDO : {PDO:.2f}")
-print(f"PDC : {PDC:.2f}\n")
+    h=df["High"].values.astype(float)
+    l=df["Low"].values.astype(float)
+    c=df["Close"].values.astype(float)
+    idx=df.index
+    ml=[]
 
-print(f"HTF short(15m): {short_trend}   HTF long(1h): {long_trend}")
-print(f"Next day open: {next_day_open:.2f}  Gap: {gap:.2f} ({gap_pct:.3f}%)  Gap bias: {gap_bias}")
-print(f"Daily Bias (aggregate): {daily_bias}\n")
+    for i in range(2,len(df)-2):
+        if abs(h[i]-h[i-1])<=h[i]*0.0003:ml.append({"type":"eq_high","level":h[i],"idx":idx[i]})
+        if abs(l[i]-l[i-1])<=l[i]*0.0003:ml.append({"type":"eq_low","level":l[i],"idx":idx[i]})
 
-print("Top Demand Zones (likely buy reactions):")
-for z in top_demands:
-    print_zone(z, side="Demand")
+    last=c[-1] if len(c)>0 else None
+    if last is not None:
+        rn=[50,100,250,500,1000]
+        for r in rn:
+            lvl=round(last/r)*r
+            if abs(last-lvl)<=last*0.001:ml.append({"type":"round","level":lvl,"idx":idx[-1]})
 
-print("Top Supply Zones (likely sell reactions):")
-for z in top_supplies:
-    print_zone(z, side="Supply")
+        qvals=[0.25,0.5,0.75]
+        p=round(last)
+        for q in qvals:
+            ql=p+q
+            if abs(last-ql)<=last*0.001:ml.append({"type":"quarter","level":ql,"idx":idx[-1]})
 
-# Optional: show merged zones as a table
-df_out = pd.DataFrame(top_demands + top_supplies)
-if not df_out.empty:
-    df_out = df_out[["low","high","width","touches","wick_score","vol_zscore","confluence_count","base_strength","prob_reversal","prob_breakout"]]
-    print("\nSummary table:")
-    print(df_out.to_string(index=False))
+        rng=h-l
+        adr=np.mean(rng[-20:]) if len(rng)>=20 else np.mean(rng)
+        ml.append({"type":"adr_high","level":last+adr,"idx":idx[-1]})
+        ml.append({"type":"adr_low","level":last-adr,"idx":idx[-1]})
 
-# Save outputs to CSV for later visual inspection
-out_csv = f"zones_{SYMBOL.replace('^','')}_{target_date}.csv"
-df_out = df_out.drop_duplicates()
-df_out.to_csv(out_csv, index=False)
-print(f"\nSaved top zones to: {out_csv}")
+        tp=(h+l+c)/3
+        v=df["Volume"].values.astype(float)
+        vwap=np.sum(tp*v)/np.sum(v) if np.sum(v)>0 else last
+        band=adr/2
+        ml.append({"type":"vwap","level":vwap,"idx":idx[-1]})
+        ml.append({"type":"vwap_up","level":vwap+band,"idx":idx[-1]})
+        ml.append({"type":"vwap_dn","level":vwap-band,"idx":idx[-1]})
 
-# End of script
+    return ml
+
+
+
+ML = magic_levels(pr)
+print("\nMagic Levels:")
+for m in ML:
+    print(f"{m['type']} : {m['level']:.2f}")
+
+print("============ RESULTS ============")
+print(f"{TD}  PDH:{PDH:.2f} PDL:{PDL:.2f} PDO:{PDO:.2f} PDC:{PDC:.2f}")
+print(f"HTF 15m:{st}  1h:{lt}")
+print(f"Open:{op:.2f} Gap:{g:.2f}({gp:.3f}%)  GapBias:{gb}")
+print("Bias:", bias)
+
+print("\nDemand Zones:")
+for z in TDZ: pz(z, "Demand")
+print("\nSupply Zones:")
+for z in TSZ: pz(z, "Supply")
+
+outdf = pd.DataFrame(TDZ + TSZ)
+if not outdf.empty:
+    outdf = outdf[["low", "high", "width", "touches", "wick_score", "vol_zscore", "confluence_count", "base_strength",
+                   "prob_reversal", "prob_breakout"]]
+    print(outdf.to_string(index=False))
+
+fn = f"zonesStats_{SY.replace('^', '')}_{TD}.csv"
+outdf.drop_duplicates().to_csv(fn, index=False)
+print("Saved:", fn)
