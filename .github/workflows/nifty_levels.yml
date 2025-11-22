@@ -21,60 +21,44 @@ jobs:
           python -m pip install --upgrade pip
           pip install yfinance pandas numpy statsmodels scikit-learn requests
 
-      - name: Run Nifty Analysis Script
+      - name: Run Nifty Scanner
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
           python << 'EOF'
-import os
-import requests
+import os, requests, subprocess
 from datetime import datetime, timedelta
 
-# --------------------------
-# 1. AUTOMATIC LAST MARKET OPEN DAY
-# --------------------------
 def last_market_day():
     today = datetime.now().date()
-    weekday = today.weekday()  # Monday=0 ... Sunday=6
-
-    if weekday == 0:  # Monday → use Friday
+    wd = today.weekday()  # Monday=0 ... Sunday=6
+    if wd == 0:  # Monday → use Friday
         return today - timedelta(days=3)
-    elif weekday == 6:  # Sunday
+    elif wd == 6:  # Sunday
         return today - timedelta(days=2)
-    elif weekday == 5:  # Saturday
+    elif wd == 5:  # Saturday
         return today - timedelta(days=1)
     else:
         return today - timedelta(days=1)
 
 target = last_market_day()
 target_str = target.strftime("%d-%m-%Y")
+print("Using market day:", target_str)
 
-print("Detected Last Market Day:", target_str)
-
-# --------------------------
-# 2. RUN YOUR HEAVY SCRIPT
-# --------------------------
-# IMPORTANT: your main file must be named `scikit_statsmodel.py`
-# and it must accept date via input()
-import subprocess
-
-proc = subprocess.Popen(
-    ["python", "scikit_statsmodel.py"],
+p = subprocess.Popen(
+    ["python", "intrdy_nif_scanner.py"],
     stdin=subprocess.PIPE,
     text=True
 )
-proc.communicate(input=target_str)
+p.communicate(input=target_str)
 
-# --------------------------
-# 3. SEND TELEGRAM ALERT
-# --------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-
 msg = f"Nifty levels generated for {target_str}"
-url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
-
+requests.post(
+    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+    data={"chat_id": CHAT_ID, "text": msg}
+)
 EOF
